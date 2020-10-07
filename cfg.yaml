@@ -1,0 +1,21 @@
+google:
+  project: jupyter-simula
+fields:
+  - id
+  - type
+  - repo.name
+  - repo.url
+  - actor.id
+  - actor.login
+  - created_at
+orgs:
+  - ipython
+  - jupyter
+  - jupyter-widgets
+  - jupyterhub
+  - jupyterlab
+  - jupyter-incubator
+  - binder-examples
+  - voila-dashboards
+  - xeus
+

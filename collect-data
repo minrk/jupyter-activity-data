@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta
+import os
+import pathlib
+
+import tqdm
+from google.cloud import bigquery
+from ruamel.yaml import YAML
+from pyarrow.feather import write_feather
+
+yaml = YAML(typ="safe")
+
+# sample query:
+# SELECT type, repo.name, actor.id AS actor_id, actor.login AS actor_login, id, created_at
+# FROM `githubarchive.day.20200915`
+# WHERE STARTS_WITH(repo.name, "jupyterhub/")
+
+data_dir = pathlib.Path("data")
+
+query_tpl = """
+SELECT {fields}
+FROM `{table}`
+WHERE {filters}
+ORDER BY created_at ASC
+"""
+
+
+def format_bytes(nbytes):
+    if nbytes < 2e4:
+        return f"{nbytes}B"
+    elif nbytes < 2e6:
+        return f"{nbytes//1024}kB"
+    elif nbytes < 2e9:
+        return f"{nbytes//(1024*1024)}MB"
+    else:
+        return f"{nbytes//(1024*1024*1024)}GB"
+
+
+def build_query(fields, orgs, table):
+    """Build a query string for fields, orgs, table"""
+    field_query_items = []
+    for field in fields:
+        if "." in field:
+            field_as = field.replace(".", "_")
+            field_query_items.append(f"{field} AS {field_as}")
+        else:
+            field_query_items.append(field)
+
+    field_query = ", ".join(field_query_items)
+
+    # one query cannot find all org repos
+    # for https://github.com/jupyter/nbviewer
+    # 2014 has repo.name=nbviewer, repo.url=https://github.com/jupyter/nbviewer
+    # 2019 has repo.name=jupyter/nbviewer, repo.url=https://api.github.com/repos/jupyter/nbviewer
+    filter_query_items = [
+        f'STARTS_WITH(repo.url, "https://github.com/{org}/") OR STARTS_WITH(repo.name, "{org}/")' for org in orgs
+    ]
+    filter_query = " OR ".join(filter_query_items)
+    return query_tpl.format(
+        fields=field_query, filters=filter_query, table=table
+    ).strip()
+
+
+def key_func(item):
+    split = item.split(".")
+    return (len(split), len(split[0]), item)
+
+
+def field_slug(fields):
+    fields = sorted(fields, key=key_func)
+    return "-".join(fields)
+
+
+def next_date(date):
+    """Get the next date, given a 4, 6, or 8-char date string"""
+    if len(date) == 4:
+        y = int(date) - 1
+        return f"{y:04}"
+    elif len(date) == 6:
+        y, m = int(date[:4]), int(date[4:])
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+        return f"{y:04}{m:02}"
+    elif len(date) == 8:
+        # full date, use datetime
+        return (datetime.strptime("%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+
+
+def normalize_query(query):
+    return query.lower().strip()
+
+
+class Downloader:
+    def __init__(self, concurrency=None, dry_run=True):
+        self.load_config()
+        self.dry_run = dry_run
+        self._in_progress = None
+        self.pool = ThreadPoolExecutor(concurrency)
+
+    def load_config(self):
+        with open("cfg.yaml") as f:
+            cfg = yaml.load(f)
+
+        self.fields = cfg["fields"]
+        self.orgs = cfg["orgs"]
+
+        gcp_project = cfg.get("google", {}).get("project")
+        self.bq = bigquery.Client(project=gcp_project)
+
+        print(f"Running BigQuery as {self.bq.project}")
+
+    @property
+    def in_progress(self):
+        if self._in_progress is None:
+            self._in_progress = {
+                normalize_query(job.query): job
+                for job in self.bq.list_jobs()
+                if not job.dry_run
+            }
+        return self._in_progress
+
+    @staticmethod
+    def _get_granularity(date):
+        """Get granularity for a date string"""
+        if len(date) == 4:
+            return "year"
+        elif len(date) == 6:
+            return "month"
+        elif len(date) == 8:
+            return "day"
+        else:
+            raise ValueError(r"date strings must be %Y[%m[%d]] format")
+
+    def download(self, start=None, end=None, confirm=True):
+        if start is None:
+            start = (datetime.today() - timedelta(days=2)).strftime("%Y%m%d")
+
+        granularity = self._get_granularity(start)
+
+        all_dates = [start]
+
+        if end:
+            if len(end) != len(start):
+                raise ValueError(
+                    f"Start and end dates must have the same format: start={start},end={end}"
+                )
+            date = start
+            while date > end:
+                date = next_date(date)
+                all_dates.append(date)
+
+        if confirm and not self.dry_run:
+            ans = input(
+                f"Download {len(all_dates)} {granularity} files from {start}-{end} [y/N]?"
+            )
+            if not ans.lower().startswith("y"):
+                print("Cancelled")
+                return
+        jobs = []
+        print(f"Submitting jobs")
+        for date in tqdm.tqdm(all_dates):
+            job_future = self.download_if_new(date)
+            if job_future:
+                jobs.append((date, job_future))
+        print(f"Awaiting results")
+        total_bytes = 0
+        for date, job_future in tqdm.tqdm(jobs):
+            job = job_future.result()
+            total_bytes += job.total_bytes_processed
+
+        print(f"{format_bytes(total_bytes)} total bytes processed")
+
+    def get_dest_file(self, date):
+        """Destination feather file"""
+        date_s = os.path.join(date[:4], date[4:]).strip("/")
+        return data_dir.joinpath(
+            field_slug(self.fields), field_slug(self.orgs), date_s + ".feather"
+        )
+
+    def download_if_new(self, date):
+        dest_file = self.get_dest_file(date)
+        if False and dest_file.exists():
+            print(f"Already have {dest_file}")
+            return
+        else:
+            return self.pool.submit(self.download_one, date)
+
+    def download_one(self, date, wait=True):
+        dest_file = self.get_dest_file(date)
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        granularity = self._get_granularity(date)
+        table = f"githubarchive.{granularity}.{date}"
+        query = build_query(fields=self.fields, orgs=self.orgs, table=table)
+        normalized = normalize_query(query)
+        if normalized in self.in_progress:
+            print(f"Already running query for {date}")
+            job = self.in_progress[normalized]
+        else:
+            print(f"Submitting new query for {date}")
+            job = self.bq.query(
+                query, job_config=bigquery.QueryJobConfig(dry_run=self.dry_run)
+            )
+        # wait for result
+        if self.dry_run:
+            return job
+
+        table = job.result().to_arrow()
+        print(
+            f"Writing {table.num_rows} rows ({format_bytes(table.nbytes)}) rows to {dest_file}"
+        )
+        write_feather(table, dest_file)
+        return job
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("start", nargs="?", help="start date")
+    parser.add_argument("end", nargs="?", help="end date")
+    parser.add_argument(
+        "--concurrency", type=int, default=10, help="Number of concurrent downloads"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Dry run to test query size"
+    )
+    args = parser.parse_args()
+
+    dl = Downloader(concurrency=args.concurrency, dry_run=args.dry_run)
+    dl.download(args.start, args.end)

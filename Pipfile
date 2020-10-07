@@ -1,0 +1,9 @@
+[requires]
+python_version = "3.8"
+
+[packages]
+google-cloud-bigquery = {extras = ["pandas","bqstorage"], version = ">= 2.0"}
+pandas = "*"
+pyarrow = "*"
+"ruamel.yaml" = "*"
+tqdm = "*"
