@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""
+Collect issue/pr events & comments
+
+used to fill holes in github archive data
+which has gaps prior to mid-2012
+
+Only run on ipython/ipython and ipython-svn-archive
+"""
+
+from pathlib import Path
+from datetime import datetime
+from itertools import chain
+import netrc
+import json
+
+from jinja2 import Template
+import requests
+import requests_cache
+import pandas as pd
+
+
+requests_cache.install_cache("github", allowable_methods=["GET", "POST"])
+
+s = requests.Session()
+auth = netrc.netrc().authenticators("api.github.com")
+if auth:
+    print("Using netrc auth token")
+    s.headers["Authorization"] = f"bearer {auth[2]}"
+else:
+    print("No auth")
+
+github_graphql = "https://api.github.com/graphql"
+
+repos = [
+    "ipython/ipython",
+    "minrk/ipython-svn-archive",
+]
+
+# 2011-09-26 is when the github archive starts collecting data
+# but there are gaps with no events in early 2012
+# so use this source for old data before 2013
+cutoff = datetime(year=2013, month=1, day=1)
+cutoff_iso = cutoff.isoformat() + "Z"
+
+issue_gql = Template(
+    """
+{
+  repository(owner: "{{ owner }}", name: "{{ name }}") {
+    {{kind}}s(first:100{% if after -%}, after: "{{ after }}" {%- endif %}) {
+      pageInfo {
+        endCursor
+        hasNextPage
+      }
+      edges {
+        node {
+          number
+          createdAt
+          author {
+            login
+          }
+          comments(first:100) {
+            pageInfo {
+              endCursor
+              hasNextPage
+            }
+            edges {
+              node {
+                createdAt
+                author {
+                  login
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+issue_comments_gql = Template(
+    """
+{
+  repository(owner: "{{owner}}", name: "{{name}}") {
+    {{kind}}(number: {{number}}) {
+      comments(first:100{% if after -%}, after: "{{ after }}" {%- endif %}) {
+        pageInfo {
+          endCursor
+          hasNextPage
+        }
+        edges {
+          node {
+            createdAt
+            author {
+              login
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+commit_gql = Template(
+    """
+{
+  repository(name: "{{name}}", owner: "{{owner}}") {
+    ref(qualifiedName: "{{ref}}") {
+      target {
+        ... on Commit {
+          history(first: 100, until: "{{cutoff}}"{% if after -%}, after: "{{ after }}" {%- endif %}) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            edges {
+              node {
+                author {
+                  email
+                  user {
+                    databaseId
+                    login
+                  }
+                  date
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+canonical_repo_url = "https://github.com/ipython/ipython"
+
+
+def make_event(event, type):
+    if event["author"]:
+        author = event["author"]["login"]
+    else:
+        author = ":ghost:"
+    return {
+        "id": None,
+        "type": type,
+        "repo_url": canonical_repo_url,
+        "actor_id": None,
+        "actor_login": author,
+        "created_at": event["createdAt"],
+    }
+
+
+def collect_comments(repo, number, kind="issue", after=None):
+    owner, name = repo.split("/")
+    event_prefix = kind[0].upper() + kind[1:]
+    query = issue_comments_gql.render(
+        owner=owner, name=name, number=number, kind=kind, after=after
+    )
+    r = s.post(github_graphql, data=json.dumps(dict(query=query)))
+    result = r.json()
+    if r.status_code >= 400:
+        print(result)
+        r.raise_for_status()
+
+    comments = result["data"]["repository"][kind]["comments"]
+    for comment in comments["edges"]:
+        comment = comment["node"]
+        if comment["createdAt"] >= cutoff_iso:
+            return
+        yield make_event(comment, type=f"{event_prefix}CommentEvent")
+    # pagination
+    if comments["pageInfo"]["hasNextPage"]:
+        for event in collect_comments(
+            repo, number, after=comments["pageInfo"]["endCursor"]
+        ):
+            yield event
+
+
+def collect_issues(repo, kind="issue", after=None):
+    print(f"Fetching {kind}s for {repo} after {after}")
+    owner, name = repo.split("/")
+    event_prefix = kind[0].upper() + kind[1:]
+
+    query = issue_gql.render(owner=owner, name=name, kind=kind, after=after)
+    r = s.post(github_graphql, data=json.dumps(dict(query=query)))
+    # r.raise_for_status()
+    result = r.json()
+    if r.status_code >= 400:
+        print(result)
+        r.raise_for_status()
+
+    issues = result["data"]["repository"][kind + "s"]
+
+    for item in issues["edges"]:
+        issue = item["node"]
+        if issue["createdAt"] >= cutoff_iso:
+            # stop at cutoff date
+            return
+        yield make_event(issue, type=f"{event_prefix}Event")
+        comments = issue["comments"]
+        for comment in comments["edges"]:
+            comment = comment["node"]
+            if comment["createdAt"] < cutoff_iso:
+                yield make_event(comment, type=f"{event_prefix}CommentEvent")
+
+        if comments["pageInfo"]["hasNextPage"]:
+            print(f"Fetching additional comments for {kind} {issue['number']}")
+            for event in collect_comments(
+                repo,
+                issue["number"],
+                kind=kind,
+                after=comments["pageInfo"]["endCursor"],
+            ):
+                yield event
+
+    if issues["pageInfo"]["hasNextPage"]:
+        for event in collect_issues(
+            repo, kind=kind, after=issues["pageInfo"]["endCursor"]
+        ):
+            yield event
+
+def collect_commits(repo, after=None):
+    print(f"Fetching commits for {repo} after {after}")
+    owner, name = repo.split("/")
+
+    query = commit_gql.render(owner=owner, name=name, ref="master", after=after, cutoff=cutoff_iso)
+    r = s.post(github_graphql, data=json.dumps(dict(query=query)))
+    # r.raise_for_status()
+    result = r.json()
+    if r.status_code >= 400:
+        print(result)
+        r.raise_for_status()
+    if "errors" in result:
+        print(result)
+        raise ValueError("error")
+
+    commits = result["data"]["repository"]["ref"]["target"]["history"]
+
+    for item in commits["edges"]:
+        commit = item["node"]
+        user = commit["author"]["user"]
+        if user:
+            login = user["login"]
+            author_id = user["databaseId"]
+        else:
+            author_id = None
+            login = commit["author"]["email"]
+        yield {
+            "id": None,
+            "type": "PushEvent",
+            "repo_url": canonical_repo_url,
+            "actor_id": author_id,
+            "actor_login": login,
+            "created_at": commit["author"]["date"],
+        }
+
+    if commits["pageInfo"]["hasNextPage"]:
+        for event in collect_commits(
+            repo, after=commits["pageInfo"]["endCursor"]
+        ):
+            yield event
+
+
+def github2dataframe(repo_name, canonical_repo_url=None):
+    events = []
+
+    for event in chain(
+        collect_issues(repo_name, kind="issue"),
+        collect_issues(repo_name, kind="pullRequest"),
+        collect_commits(repo_name)
+    ):
+        events.append(event)
+        if len(events) % 100 == 0:
+            print(f"Collected {len(events)} events for {repo_name}")
+    df = pd.DataFrame(events)
+    df = df.astype({"id": pd.Int64Dtype(), "actor_id": pd.Int64Dtype()})
+    df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    return df
+
+
+data_dir = Path("data")
+
+
+def main():
+    for repo in repos:
+        df = github2dataframe(repo)
+        dest = data_dir.joinpath("old").joinpath(repo.replace("/", "-") + ".feather")
+        dest.parent.mkdir(exist_ok=True, parents=True)
+        df.to_feather(dest)
+
+if __name__ == "__main__":
+    main()
