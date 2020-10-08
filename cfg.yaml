@@ -18,4 +18,15 @@ orgs:
   - binder-examples
   - voila-dashboards
   - xeus
+renames:
+  ipython/ipywidgets: jupyter-widgets/ipywidgets
+dates:
+  2010-05-10: ipython arrives on github
+  2011-12-19: First release of notebook (IPython 0.12)
+  2014-04-23: Jupyter org created
+  2015-03-03: JupyterHub first release
+  # 2016-03-18: jupyterhub org created
+  # 2016-07-15: JupyterLab first release
+  # 2016-10-12: jupyterlab org created
+  # 2019-06-28: JupyterLab 1.0
 

@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""
+collect email data
+
+two sources:
+
+1. ipython-dev mailman archive
+2. mbox export of jupyter google group (retrieved via Google Takeout)
+"""
+
+import email.utils
+import mailbox
+import gzip
+import re
+from pathlib import Path
+
+from bs4 import BeautifulSoup
+import pandas as pd
+
+import requests
+import requests_cache
+
+requests_cache.install_cache("emails")
+
+archive_url = "https://mail.python.org/pipermail/ipython-dev/"
+# use a fake repo url that will parse into our data processing
+repo_url = "https://mail.python.org/ipython/ipython-dev-list"
+
+header_pat = re.compile(
+    r"^From:\s*(\S+)\s+at\s+(\S+)\s+.*\nDate:\s*(.*)$", re.MULTILINE | re.VERBOSE
+)
+
+
+def process_one_archive(r):
+    """Process one gzipped mailman archive
+
+    r is the requests.Response object
+
+    actor_login is the email username, may not be unique
+    """
+    text = gzip.decompress(r.content).decode("utf8", "replace")
+    for name, domain, date_str in header_pat.findall(text):
+        date = email.utils.parsedate_to_datetime(date_str)
+        yield {
+            "id": None,
+            "type": "EmailEvent",
+            "repo_url": repo_url,
+            "actor_login": name,
+            "actor_id": None,
+            "created_at": date,
+        }
+
+
+def download_archives(archive_url):
+    """Yield EmailEvents for a mailman archive page"""
+    r = requests.get(archive_url)
+    r.raise_for_status()
+    page = BeautifulSoup(r.text)
+    table = page.find("table")
+    # cheat! Find all the gzip links
+    # good enough for mailman
+    links = table.find_all("a")
+    for link in links:
+        if not link["href"].endswith(".txt.gz"):
+            continue
+        # resolve relative link logic?
+        url = archive_url + link["href"]
+        print(f"Downloading {url}")
+        r = requests.get(url)
+        r.raise_for_status()
+        for event in process_one_archive(r):
+            yield event
+
+
+def mbox_events(mbox_path):
+    """Yield EmailEvents for a .mbox file
+
+    actor_login is the email username, may not be unique
+    """
+    group_name = mbox_path.name.split("@", 1)[0]
+    repo_url = f"https://groups.google.com/jupyter/{group_name}"
+    for message in mailbox.mbox(mbox_path):
+        date = email.utils.parsedate_to_datetime(message["Date"])
+        name, address = email.utils.parseaddr(message["From"])
+        login = address.split("@", 1)[0]
+        yield {
+            "id": None,
+            "type": "EmailEvent",
+            "repo_url": repo_url,
+            "actor_login": login,
+            "actor_id": None,
+            "created_at": date,
+        }
+
+
+def events2df(event_source, label="source"):
+    """Convert event-generator to a DataFrame"""
+    events = []
+    for event in event_source:
+        events.append(event)
+        if len(events) % 100 == 0:
+            print(f"Collected {len(events)} events for {label}")
+
+    df = pd.DataFrame(events)
+    df = df.astype({"id": pd.Int64Dtype(), "actor_id": pd.Int64Dtype()})
+    df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    return df
+
+
+def main():
+    data_dir = Path("data")
+    email_dir = data_dir.joinpath("email")
+    email_dir.mkdir(exist_ok=True, parents=True)
+    dest = email_dir.joinpath(archive_url.rstrip("/").rsplit("/", 1)[-1] + ".feather")
+    if not dest.exists():
+        df = events2df(download_archives(archive_url), archive_url)
+        df.to_feather(dest)
+    # takeout dir created with Google Takeout
+    for mbox in Path("takeout").glob("*.mbox"):
+        name = mbox.stem
+        dest = email_dir.joinpath(name + ".feather")
+        if not dest.exists():
+            df = events2df(mbox_events(mbox), name)
+            df.to_feather(dest)
+
+
+if __name__ == "__main__":
+    main()
