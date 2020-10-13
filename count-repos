@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+Collect issue/pr events & comments
+
+used to fill holes in github archive data
+which has gaps prior to mid-2012
+
+Only run on ipython/ipython and ipython-svn-archive
+"""
+
+from pathlib import Path
+from datetime import datetime
+from itertools import chain
+import netrc
+import json
+
+from jinja2 import Template
+import requests
+import requests_cache
+import pandas as pd
+
+from ruamel.yaml import YAML
+
+yaml = YAML(typ="safe")
+
+
+requests_cache.install_cache("github", allowable_methods=["GET", "POST"])
+
+s = requests.Session()
+auth = netrc.netrc().authenticators("api.github.com")
+if auth:
+    print("Using netrc auth token")
+    s.headers["Authorization"] = f"bearer {auth[2]}"
+else:
+    print("No auth")
+
+github_graphql = "https://api.github.com/graphql"
+
+with open("cfg.yaml") as f:
+    cfg = yaml.load(f)
+
+orgs = cfg["orgs"]
+
+
+repos_gql = Template(
+    """
+{
+  organization(login: "{{ org }}") {
+    repositories(first:100{% if after -%}, after: "{{ after }}" {%- endif %}) {
+      pageInfo {
+        endCursor
+        hasNextPage
+      }
+      edges {
+        node {
+          name
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+
+def count_repos(org, after=None):
+    print(f"Counting repos for {org}")
+    query = repos_gql.render(
+        org=org, after=after,
+    )
+    r = s.post(github_graphql, data=json.dumps(dict(query=query)))
+    result = r.json()
+    if r.status_code >= 400:
+        print(result)
+        r.raise_for_status()
+
+    repos = result["data"]["organization"]["repositories"]
+    count = len(repos["edges"])
+    # pagination
+    if repos["pageInfo"]["hasNextPage"]:
+        count += count_repos(org, after=repos["pageInfo"]["endCursor"])
+    return count
+
+
+def main():
+    total = 0
+    pad = max(len(org) for org in orgs) + 2
+    for org in orgs:
+        count = count_repos(org)
+        total += count
+        print(f"{org.ljust(pad)}: {count}")
+    total_label = f"{len(orgs)} orgs"
+    print(f"{total_label.ljust(pad)}: {total}")
+
+
+if __name__ == "__main__":
+    main()

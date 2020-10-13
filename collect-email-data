@@ -6,6 +6,9 @@ two sources:
 
 1. ipython-dev mailman archive
 2. mbox export of jupyter google group (retrieved via Google Takeout)
+
+In both cases, rather than trying to resolve email->github user,
+use. This results in imperfect user identification, but event counts are low.
 """
 
 import email.utils
